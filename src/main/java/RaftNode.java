@@ -4,8 +4,8 @@ import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -18,10 +18,10 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class RaftNode extends UnicastRemoteObject implements RaftRMI {
     //
-    private ExecutorService es = Executors.newFixedThreadPool(8);
+    private final ExecutorService es = Executors.newFixedThreadPool(8);
 
-    private RaftRole role = RaftRole.FOLLOWER;
-    private int msPassed = 0; // 计时
+    private volatile RaftRole role = RaftRole.FOLLOWER;
+    private volatile int msPassed = 0; // 计时
     private int followerExpire = 150; // follower -> candidate 等待时间
     private int candidatExpire = 150; // candidate -> new candidate
     private final int leaderExpire = 10; // 心跳信号的间隔
@@ -34,17 +34,18 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
     private int leaderID = 0; // 当前 leader 的ID
     private int serverID = 0; // 当前服务器的 ID
     private int commitIndex;
-    private int lastApplied;
+    private int lastApplied; // 上位机使用
+    private volatile boolean onVoting; // 投票可能有多轮，下一轮投票开始之后上一轮投票线程应释放。
     // Raft leader state
-    private int[] nextIndex = new int[5];
-    private int[] matchIndex = new int[5];
+    private final int[] nextIndex = new int[5];
+    private final int[] matchIndex = new int[5];
 
     public RaftNode(int id) throws RemoteException {
         serverID = id;
         Random rand = new Random();
         followerExpire = rand.nextInt(150) + 150; // 150 ms - 300 ms
         candidatExpire = rand.nextInt(50) + 50; // 50 ms - 100 ms
-        es.submit(()->{ // 计时器
+        while (true) {
             try {
                 Thread.sleep(1000); // 休眠 1ms 调试时设置为1s
                 msPassed ++;
@@ -60,61 +61,55 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
                 }
                 case CANDIDATE -> { // candidate 超时 开始下一任期
                     if (msPassed >= candidatExpire) {
-                        currentTerm ++;
                         msPassed = 0;
                         //
-                        currentTerm ++;
                         voteFor = serverID; // 第一票投给自己
-                        int cnt = 1;
-                        for (int i = 0; i < 5; i ++) {
-                            if (i == serverID) continue;
+                        CountDownLatch cdl = new CountDownLatch(2);
+                        while (role == RaftRole.CANDIDATE) {
+                            onVoting = true;
+                            currentTerm ++;
+                            candidatExpire = rand.nextInt(50) + 50; // 重设投票过期时间
+                            for (int i = 0; i < 5; i ++) {
+                                if (i == serverID) continue;
+                                requestVoteLauncher(i, cdl);
+                            }
                             try {
-                                Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
-                                RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
-                                RestResult r;
-                                if (logs.size() == 0) {
-                                    r = raftRMI.requestVote(currentTerm, serverID, 0, 0);
-                                } else {
-                                    RaftLog lastLog = (RaftLog) JSON.parse(logs.get(logs.size() - 1));
-                                    r = raftRMI.requestVote(currentTerm, serverID, logs.size() - 1, lastLog.getTerm());
-                                }
-                                if (r.isResult()) {
-                                    cnt ++;
-                                }
-                                if (cnt >= 3) { // 选举成功，转化为leader
+                                cdl.wait(candidatExpire);
+                                onVoting = false; // 取消所有的投票线程
+
+                                if (cdl.getCount() >= 2) { // 投票成功 转化为leader并，进行leader的初始化工作，开始同步数据
                                     role = RaftRole.LEADER;
+                                    for (int i = 0; i < 5; i ++) { // 开启数据同步线程。注意这里和原论文有出入，分离心跳信号和同步操作
+                                        if (i == serverID) continue;
+                                        appendEntriesLauncher(i);
+                                    }
                                 }
-                            } catch (RemoteException | NotBoundException re) {
-                                log.error(re.toString());
+                            } catch (InterruptedException e) {
+                                log.error(e.toString());
                             }
                         }
                     }
                 }
-                case LEADER -> { // leader 发布心跳信号，执行同步命令
+                case LEADER -> { // leader 发布心跳信号
                     if (msPassed >= leaderExpire) {
                         msPassed = 0;
-                        for (int i = 0; i < 5; i ++) {
+                        for (int i = 0; i < 5; i ++) { // 开启数据同步线程。注意这里和原论文有出入，分离心跳信号和同步操作
                             if (i == serverID) continue;
-                            try {
-                                Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
-                                RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
-                                RestResult r = raftRMI.appendEntries(currentTerm, serverID, 0, 0, null, commitIndex);
-                                if (!r.isResult()) {
-                                    role = RaftRole.FOLLOWER;
-                                }
-                            } catch (RemoteException | NotBoundException re) {
-                                log.error(re.toString());
+                            RestResult heartbeat = appendEntries(currentTerm, serverID, 0, 0, null, commitIndex);
+                            if (heartbeat.getTerm() > currentTerm) { // 存在新一轮选举，说明当前leader已经过期
+                                role = RaftRole.FOLLOWER;
+                                break;
                             }
                         }
                     }
-
                 }
             }
-        });
+        }
+
     }
 
     /**
-     *
+     * if (term == currentTerm && logs[prevLogIndex] exits and matches prevLogTerm), return true, else return false.
      * @param term term of the current leader.
      * @param leaderID leader id.
      * @param prevLogIndex the log index that is confirmed by the leader.
@@ -127,26 +122,55 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
         msPassed = 0; // 心跳信号送达，计数器置零
         commitIndex = leaderCommit;
         this.leaderID = leaderID;
+        role = RaftRole.FOLLOWER;
         if (term < currentTerm) {
             return new RestResult(currentTerm, false);
         }
         if (nxtLogs == null) { // 心跳信号
-            if (prevLogIndex >= logs.size()) {
-                return new RestResult(currentTerm, false);
-            } else {
-                RaftLog prevLog = (RaftLog) JSON.parse(logs.get(prevLogIndex));
-                return new RestResult(currentTerm, prevLog.getTerm() == prevLogTerm);
-            }
-        } else {
-            int nxtPtr = 0;
-            while (prevLogIndex < logs.size()) {
-                logs.set(prevLogIndex++, nxtLogs.get(nxtPtr++));
-            }
-            while (nxtPtr < nxtLogs.size()) {
-                logs.add(nxtLogs.get(nxtPtr++));
-            }
             return new RestResult(currentTerm, true);
+        } else if (prevLogIndex >= logs.size()) { //
+            return new RestResult(currentTerm, false);
+        } else {
+            RaftLog raftLog = (RaftLog) JSON.parse(logs.get(prevLogIndex));
+            if (raftLog.getTerm() == prevLogTerm) { // 当前最新的 log 与 leader 匹配，则将剩余的log加入末尾
+                int ts = logs.size();
+                for (int di = prevLogIndex + 1; di < ts; di ++) { // 删除不匹配的日志项
+                    logs.remove(logs.size() - 1);
+                }
+                logs.addAll(nxtLogs);
+                return new RestResult(currentTerm, true);
+            } else {
+                return new RestResult(currentTerm, false);
+            }
         }
+    }
+
+    private void appendEntriesLauncher(int i) {
+        LinkedList<String> nxtLogs = new LinkedList<>();
+        try {
+            Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
+            RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
+            while (role == RaftRole.LEADER) {
+                RaftLog raftLog = (RaftLog) JSON.parse(logs.get(nextIndex[i]));
+                RestResult r = raftRMI.appendEntries(currentTerm, serverID, nextIndex[i], raftLog.getTerm(), nxtLogs, commitIndex);
+                if (r.getTerm() > currentTerm) { // 出现新的任期，退出同步线程
+                    role = RaftRole.FOLLOWER;
+                    break;
+                }
+                if (r.isResult()) { // prevLogIndex确认，更新 commitIndex
+                    matchIndex[i] ++;
+                    int[] tmp = Arrays.copyOf(matchIndex, 5);
+                    Arrays.sort(tmp);
+                    commitIndex = tmp[3];
+                } else {
+                    nextIndex[i] --;
+                    nxtLogs.addFirst(logs.get(nextIndex[i]));
+                }
+            }
+        } catch (RemoteException | NotBoundException re) {
+            log.error(re.toString());
+        }
+
     }
 
     /**
@@ -177,4 +201,26 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
         return new RestResult(currentTerm, false);
     }
 
+    private void requestVoteLauncher(int i, CountDownLatch cdl) {
+        es.submit(()-> {
+            while (onVoting) {
+                try {
+                    Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
+                    RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
+                    RestResult r;
+                    if (logs.size() == 0) {
+                        r = raftRMI.requestVote(currentTerm, serverID, 0, 0);
+                    } else {
+                        RaftLog lastLog = (RaftLog) JSON.parse(logs.get(logs.size() - 1));
+                        r = raftRMI.requestVote(currentTerm, serverID, logs.size() - 1, lastLog.getTerm());
+                    }
+                    if (r.isResult()) {
+                        cdl.countDown();
+                    }
+                } catch (RemoteException | NotBoundException re) {
+                    log.error(re.toString());
+                }
+            }
+        });
+    }
 }
