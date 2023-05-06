@@ -42,9 +42,8 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
 
     public RaftNode(int id) throws RemoteException {
         serverID = id;
-        Random rand = new Random();
-        followerExpire = rand.nextInt(150) + 150; // 150 ms - 300 ms
-        candidatExpire = rand.nextInt(50) + 50; // 50 ms - 100 ms
+        roleSwitch(RaftRole.CANDIDATE);
+        roleSwitch(RaftRole.FOLLOWER);
         while (true) {
             try {
                 Thread.sleep(1000); // 休眠 1ms 调试时设置为1s
@@ -55,20 +54,13 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
             switch (role) {
                 case FOLLOWER -> { // follower 超时，开启选举操作
                     if (msPassed >= followerExpire) {
-                        role = RaftRole.CANDIDATE;
-                        msPassed = candidatExpire;
-                    }
-                }
-                case CANDIDATE -> { // candidate 超时 开始下一任期
-                    if (msPassed >= candidatExpire) {
                         msPassed = 0;
-                        //
+                        roleSwitch(RaftRole.CANDIDATE);
                         voteFor = serverID; // 第一票投给自己
-                        CountDownLatch cdl = new CountDownLatch(2);
-                        while (role == RaftRole.CANDIDATE) {
+                        while (role == RaftRole.CANDIDATE) { // 每次轮选举持续 candidateExpire 时间
+                            CountDownLatch cdl = new CountDownLatch(2);
                             onVoting = true;
                             currentTerm ++;
-                            candidatExpire = rand.nextInt(50) + 50; // 重设投票过期时间
                             for (int i = 0; i < 5; i ++) {
                                 if (i == serverID) continue;
                                 requestVoteLauncher(i, cdl);
@@ -76,9 +68,10 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
                             try {
                                 cdl.wait(candidatExpire);
                                 onVoting = false; // 取消所有的投票线程
-
-                                if (cdl.getCount() >= 2) { // 投票成功 转化为leader并，进行leader的初始化工作，开始同步数据
-                                    role = RaftRole.LEADER;
+                                if (cdl.getCount() >= 2) { // 投票成功 转化为leader并进行leader的初始化工作，开始同步数据
+                                    roleSwitch(RaftRole.LEADER);
+                                    Arrays.fill(matchIndex, -1);
+                                    Arrays.fill(nextIndex, logs.size());
                                     for (int i = 0; i < 5; i ++) { // 开启数据同步线程。注意这里和原论文有出入，分离心跳信号和同步操作
                                         if (i == serverID) continue;
                                         appendEntriesLauncher(i);
@@ -97,7 +90,7 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
                             if (i == serverID) continue;
                             RestResult heartbeat = appendEntries(currentTerm, serverID, 0, 0, null, commitIndex);
                             if (heartbeat.getTerm() > currentTerm) { // 存在新一轮选举，说明当前leader已经过期
-                                role = RaftRole.FOLLOWER;
+                                roleSwitch(RaftRole.FOLLOWER);
                                 break;
                             }
                         }
@@ -122,7 +115,7 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
         msPassed = 0; // 心跳信号送达，计数器置零
         commitIndex = leaderCommit;
         this.leaderID = leaderID;
-        role = RaftRole.FOLLOWER;
+        roleSwitch(RaftRole.FOLLOWER);
         if (term < currentTerm) {
             return new RestResult(currentTerm, false);
         }
@@ -130,6 +123,10 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
             return new RestResult(currentTerm, true);
         } else if (prevLogIndex >= logs.size()) { //
             return new RestResult(currentTerm, false);
+        } else if (prevLogIndex == -1) { // 当前logs为空
+            logs.clear();
+            logs.addAll(nxtLogs);
+            return new RestResult(currentTerm, true);
         } else {
             RaftLog raftLog = (RaftLog) JSON.parse(logs.get(prevLogIndex));
             if (raftLog.getTerm() == prevLogTerm) { // 当前最新的 log 与 leader 匹配，则将剩余的log加入末尾
@@ -146,23 +143,25 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
     }
 
     private void appendEntriesLauncher(int i) {
-        LinkedList<String> nxtLogs = new LinkedList<>();
+        LinkedList<String> nxtLogs = new LinkedList<>(); // 此处可考虑使用下标，是一个空间和时间的 trade-off
         try {
             Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
             RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
             while (role == RaftRole.LEADER) {
                 RaftLog raftLog = (RaftLog) JSON.parse(logs.get(nextIndex[i]));
                 RestResult r = raftRMI.appendEntries(currentTerm, serverID, nextIndex[i], raftLog.getTerm(), nxtLogs, commitIndex);
-                if (r.getTerm() > currentTerm) { // 出现新的任期，退出同步线程
-                    role = RaftRole.FOLLOWER;
+                if (r.getTerm() > currentTerm) { // 出现新的任期，修改当前服务器角色为FOLLOWER并退出同步线程
+                    roleSwitch(RaftRole.FOLLOWER);
                     break;
                 }
-                if (r.isResult()) { // prevLogIndex确认，更新 commitIndex
-                    matchIndex[i] ++;
+                if (r.isResult()) { // prevLogIndex确认，更新 commitIndex，清空传输队列
+                    matchIndex[i] = nextIndex[i];
+                    nextIndex[i] ++;
+                    nxtLogs.clear();
                     int[] tmp = Arrays.copyOf(matchIndex, 5);
                     Arrays.sort(tmp);
-                    commitIndex = tmp[3];
-                } else {
+                    commitIndex = Math.max(commitIndex, tmp[3]); // commitIndex 单增
+                } else { // 否则递减 nextIndex 并将需要的额nxtLogs添加到数组中
                     nextIndex[i] --;
                     nxtLogs.addFirst(logs.get(nextIndex[i]));
                 }
@@ -181,9 +180,10 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
      * @param lastLogTerm the lastest log term of the current candidate.
      * @return RestResult
      */
-    public synchronized RestResult requestVote(int term, int candidatID, int lastLogIndex, int lastLogTerm) {
+    public RestResult requestVote(int term, int candidatID, int lastLogIndex, int lastLogTerm) {
         if (currentTerm < term) {
             currentTerm = term;
+            roleSwitch(RaftRole.FOLLOWER);
             voteFor = 0;
         }
         if (term < currentTerm || (voteFor != 0 && voteFor != candidatID)) { // 候选人的term已过期或当前服务器已投其他候选人
@@ -203,7 +203,7 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
 
     private void requestVoteLauncher(int i, CountDownLatch cdl) {
         es.submit(()-> {
-            while (onVoting) {
+            while (onVoting && role == RaftRole.CANDIDATE) {
                 try {
                     Registry registry = LocateRegistry.getRegistry("localhost", Registry.REGISTRY_PORT);
                     RaftRMI raftRMI = (RaftRMI) registry.lookup("/raft/" + i);
@@ -222,5 +222,26 @@ public class RaftNode extends UnicastRemoteObject implements RaftRMI {
                 }
             }
         });
+    }
+
+    /**
+     * perform exchange of role. assign new random expire time.
+     * @param newRole
+     */
+    private void roleSwitch(RaftRole newRole) {
+        Random rand = new Random();
+        switch (newRole) {
+            case LEADER -> {
+                role = RaftRole.LEADER;
+            }
+            case FOLLOWER -> {
+                role = RaftRole.FOLLOWER;
+                followerExpire = rand.nextInt(50) + 50;
+            }
+            case CANDIDATE -> {
+                role = RaftRole.CANDIDATE;
+                candidatExpire = rand.nextInt(50) + 50;
+            }
+        }
     }
 }
